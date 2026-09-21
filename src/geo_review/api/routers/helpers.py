@@ -4,6 +4,28 @@ import base64
 from typing import Any, Dict, Optional
 
 from fastapi import UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+
+from geo_review.result.builder import ReviewResultFormatter
+from geo_review.result.models import ReviewResponse
+
+
+def format_response(result: ReviewResponse, output_format: str = "json"):
+    """根据 output_format 返回对应的 FastAPI 响应.
+
+    - json: 返回 JSONResponse（结构化审核结果）
+    - markdown: 返回 PlainTextResponse（Markdown 报告）
+    - html: 返回 HTMLResponse（可视化 HTML 报告）
+    """
+    fmt = (output_format or "json").lower()
+    if fmt == "markdown":
+        return PlainTextResponse(
+            ReviewResultFormatter.to_markdown(result),
+            media_type="text/markdown; charset=utf-8",
+        )
+    if fmt == "html":
+        return HTMLResponse(ReviewResultFormatter.to_html(result))
+    return JSONResponse(result.model_dump(mode="json", by_alias=True))
 
 
 def get_file_extension(filename: Optional[str]) -> str:
