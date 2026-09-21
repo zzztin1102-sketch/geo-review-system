@@ -7,9 +7,9 @@
 """
 
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, ClassVar, Dict, List, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 # ----------------------------------------------------------------------
@@ -203,7 +203,12 @@ class BatchReviewResponse(BaseModel):
 
 
 class BatchReviewRequest(BaseModel):
-    """批量审核请求."""
+    """批量审核请求.
+
+    单次批量最多 30 篇待审核正文（上限）。
+    """
+
+    MAX_BATCH_ITEMS: ClassVar[int] = 30
 
     batch_id: Optional[str] = None
     items: List[Dict[str, Any]]
@@ -212,3 +217,14 @@ class BatchReviewRequest(BaseModel):
     shared_rules: Optional[Dict[str, Any]] = None
     options: Optional[ReviewOptions] = None
     metadata: Optional[RequestMetadata] = None
+
+    @field_validator("items")
+    @classmethod
+    def _validate_items_limit(cls, v):
+        if not v:
+            raise ValueError("批量审核至少包含 1 篇待审核正文")
+        if len(v) > cls.MAX_BATCH_ITEMS:
+            raise ValueError(
+                f"单次批量审核最多 {cls.MAX_BATCH_ITEMS} 篇，当前提交 {len(v)} 篇"
+            )
+        return v

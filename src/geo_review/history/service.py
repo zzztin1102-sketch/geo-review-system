@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from geo_review.utils.time import now as beijing_now
 
-from sqlalchemy import String, select, update, delete, desc, func
+from sqlalchemy import String, select, update, delete, desc, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from geo_review.history.models import ReviewHistory, ReviewIssue
@@ -21,7 +21,65 @@ class HistoryService:
     def __init__(self, async_session):
         self.async_session = async_session
 
-    async def save_review(self, response: ReviewResponse, request_data: Dict[str, Any] = None, batch_id: Optional[str] = None, item_id: Optional[str] = None):
+    @staticmethod
+    def _apply_user_scope(stmt, user_id: Optional[str], is_admin: bool):
+        """非管理员仅可访问本人提交的记录."""
+        if not is_admin and user_id:
+            return stmt.where(ReviewHistory.user_id == user_id)
+        return stmt
+
+    @staticmethod
+    def _apply_list_filters(
+        stmt,
+        *,
+        verdict: Optional[str] = None,
+        status: Optional[str] = None,
+        company_name: Optional[str] = None,
+        task_name: Optional[str] = None,
+        content_title: Optional[str] = None,
+        submission_name: Optional[str] = None,
+        batch_id: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ):
+        if verdict:
+            stmt = stmt.where(ReviewHistory.verdict == verdict)
+        if status:
+            stmt = stmt.where(ReviewHistory.status == status)
+        if company_name:
+            stmt = stmt.where(ReviewHistory.company_name.ilike(f"%{company_name}%"))
+        if task_name:
+            stmt = stmt.where(ReviewHistory.task_name.ilike(f"%{task_name}%"))
+        if content_title:
+            stmt = stmt.where(ReviewHistory.content_title.ilike(f"%{content_title}%"))
+        if batch_id:
+            stmt = stmt.where(ReviewHistory.batch_id == batch_id)
+        if submission_name:
+            fn_expr = func.json_extract(ReviewHistory.submission_data, "$.filename").cast(String)
+            stmt = stmt.where(fn_expr.ilike(f"%{submission_name}%"))
+        if start_date:
+            try:
+                start_dt = datetime.fromisoformat(start_date)
+                stmt = stmt.where(ReviewHistory.reviewed_at >= start_dt)
+            except ValueError:
+                pass
+        if end_date:
+            try:
+                end_dt = datetime.fromisoformat(end_date)
+                stmt = stmt.where(ReviewHistory.reviewed_at <= end_dt)
+            except ValueError:
+                pass
+        return stmt
+
+    async def save_review(
+        self,
+        response: ReviewResponse,
+        request_data: Dict[str, Any] = None,
+        batch_id: Optional[str] = None,
+        item_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        submitted_by: Optional[str] = None,
+    ):
         """保存审核结果到历史记录.
 
         Args:
@@ -83,7 +141,8 @@ class HistoryService:
                 error_message=response.error.message if response.error else None,
                 reviewed_at=response.reviewed_at,
                 duration_ms=response.duration_ms,
-                submitted_by=None,
+                submitted_by=submitted_by,
+                user_id=user_id,
                 batch_id=batch_id,
                 item_id=item_id,
             )
@@ -110,23 +169,35 @@ class HistoryService:
 
             return history.id
 
-    async def get_review(self, review_id: str) -> Optional[ReviewHistory]:
+    async def get_review(
+        self,
+        review_id: str,
+        user_id: Optional[str] = None,
+        is_admin: bool = False,
+    ) -> Optional[ReviewHistory]:
         """获取单条审核记录."""
         async with self.async_session() as session:
             stmt = select(ReviewHistory).where(
                 ReviewHistory.review_id == review_id,
                 ReviewHistory.is_deleted == False,
             )
+            stmt = self._apply_user_scope(stmt, user_id, is_admin)
             result = await session.execute(stmt)
             return result.scalar_one_or_none()
 
-    async def get_review_with_issues(self, review_id: str) -> Optional[Dict[str, Any]]:
+    async def get_review_with_issues(
+        self,
+        review_id: str,
+        user_id: Optional[str] = None,
+        is_admin: bool = False,
+    ) -> Optional[Dict[str, Any]]:
         """获取审核记录及其问题列表（含完整内容）."""
         async with self.async_session() as session:
             stmt = select(ReviewHistory).where(
                 ReviewHistory.review_id == review_id,
                 ReviewHistory.is_deleted == False,
             )
+            stmt = self._apply_user_scope(stmt, user_id, is_admin)
             result = await session.execute(stmt)
             history = result.scalar_one_or_none()
 
@@ -159,43 +230,25 @@ class HistoryService:
         end_date: Optional[str] = None,
         sort_by: str = "reviewed_at",
         sort_order: str = "desc",
+        user_id: Optional[str] = None,
+        is_admin: bool = False,
     ) -> Tuple[List[Dict[str, Any]], int]:
         """分页查询审核记录列表."""
         async with self.async_session() as session:
-            stmt = select(ReviewHistory).where(ReviewHistory.is_deleted == False)
-
-            if verdict:
-                stmt = stmt.where(ReviewHistory.verdict == verdict)
-            if status:
-                stmt = stmt.where(ReviewHistory.status == status)
-            if company_name:
-                stmt = stmt.where(ReviewHistory.company_name.ilike(f"%{company_name}%"))
-            if task_name:
-                stmt = stmt.where(ReviewHistory.task_name.ilike(f"%{task_name}%"))
-            if content_title:
-                stmt = stmt.where(ReviewHistory.content_title.ilike(f"%{content_title}%"))
-            if batch_id:
-                stmt = stmt.where(ReviewHistory.batch_id == batch_id)
-
-            # 提报表：用 json_extract 提取 filename 字段后再 LIKE
-            # 这样直接在实际字符串值上匹配，不受 JSON ensure_ascii 转义影响
-            if submission_name:
-                fn_expr = func.json_extract(ReviewHistory.submission_data, '$.filename').cast(String)
-                stmt = stmt.where(fn_expr.ilike(f"%{submission_name}%"))
-
-            if start_date:
-                try:
-                    start_dt = datetime.fromisoformat(start_date)
-                    stmt = stmt.where(ReviewHistory.reviewed_at >= start_dt)
-                except ValueError:
-                    pass
-
-            if end_date:
-                try:
-                    end_dt = datetime.fromisoformat(end_date)
-                    stmt = stmt.where(ReviewHistory.reviewed_at <= end_dt)
-                except ValueError:
-                    pass
+            base = select(ReviewHistory).where(ReviewHistory.is_deleted == False)
+            base = self._apply_user_scope(base, user_id, is_admin)
+            filter_kw = dict(
+                verdict=verdict,
+                status=status,
+                company_name=company_name,
+                task_name=task_name,
+                content_title=content_title,
+                submission_name=submission_name,
+                batch_id=batch_id,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            stmt = self._apply_list_filters(base, **filter_kw)
 
             order_column = getattr(ReviewHistory, sort_by, ReviewHistory.reviewed_at)
             if sort_order == "desc":
@@ -203,20 +256,11 @@ class HistoryService:
             else:
                 stmt = stmt.order_by(order_column)
 
-            total_stmt = select(func.count()).select_from(ReviewHistory).where(ReviewHistory.is_deleted == False)
-            if verdict:
-                total_stmt = total_stmt.where(ReviewHistory.verdict == verdict)
-            if status:
-                total_stmt = total_stmt.where(ReviewHistory.status == status)
-            if company_name:
-                total_stmt = total_stmt.where(ReviewHistory.company_name.ilike(f"%{company_name}%"))
-            if task_name:
-                total_stmt = total_stmt.where(ReviewHistory.task_name.ilike(f"%{task_name}%"))
-            if content_title:
-                total_stmt = total_stmt.where(ReviewHistory.content_title.ilike(f"%{content_title}%"))
-            if submission_name:
-                fn_expr = func.json_extract(ReviewHistory.submission_data, '$.filename').cast(String)
-                total_stmt = total_stmt.where(fn_expr.ilike(f"%{submission_name}%"))
+            total_base = select(func.count()).select_from(ReviewHistory).where(
+                ReviewHistory.is_deleted == False
+            )
+            total_base = self._apply_user_scope(total_base, user_id, is_admin)
+            total_stmt = self._apply_list_filters(total_base, **filter_kw)
 
             total_result = await session.execute(total_stmt)
             total = total_result.scalar() or 0
@@ -283,13 +327,21 @@ class HistoryService:
 
             return {"updated_task_name": updated_task, "updated_company_name": updated_company, "scanned": len(histories)}
 
-    async def delete_review(self, review_id: str) -> bool:
+    async def delete_review(
+        self,
+        review_id: str,
+        user_id: Optional[str] = None,
+        is_admin: bool = False,
+    ) -> bool:
         """软删除审核记录."""
         async with self.async_session() as session:
             stmt = update(ReviewHistory).where(
                 ReviewHistory.review_id == review_id,
                 ReviewHistory.is_deleted == False,
-            ).values(is_deleted=True, updated_at=beijing_now())
+            )
+            if not is_admin and user_id:
+                stmt = stmt.where(ReviewHistory.user_id == user_id)
+            stmt = stmt.values(is_deleted=True, updated_at=beijing_now())
 
             result = await session.execute(stmt)
             await session.commit()
@@ -297,7 +349,11 @@ class HistoryService:
             return result.rowcount > 0
 
     async def update_human_review(
-        self, review_id: str, human_review_data: Dict[str, Any]
+        self,
+        review_id: str,
+        human_review_data: Dict[str, Any],
+        user_id: Optional[str] = None,
+        is_admin: bool = False,
     ) -> bool:
         """保存人工复核结果.
 
@@ -315,6 +371,7 @@ class HistoryService:
                 ReviewHistory.review_id == review_id,
                 ReviewHistory.is_deleted == False,
             )
+            stmt = self._apply_user_scope(stmt, user_id, is_admin)
             result = await session.execute(stmt)
             history = result.scalar_one_or_none()
             if not history:
@@ -342,26 +399,41 @@ class HistoryService:
             await session.commit()
             return True
 
-    async def batch_delete(self, review_ids: List[str]) -> int:
+    async def batch_delete(
+        self,
+        review_ids: List[str],
+        user_id: Optional[str] = None,
+        is_admin: bool = False,
+    ) -> int:
         """批量软删除审核记录."""
         async with self.async_session() as session:
             stmt = update(ReviewHistory).where(
                 ReviewHistory.review_id.in_(review_ids),
                 ReviewHistory.is_deleted == False,
-            ).values(is_deleted=True, updated_at=beijing_now())
+            )
+            if not is_admin and user_id:
+                stmt = stmt.where(ReviewHistory.user_id == user_id)
+            stmt = stmt.values(is_deleted=True, updated_at=beijing_now())
 
             result = await session.execute(stmt)
             await session.commit()
 
             return result.rowcount
 
-    async def get_batch_results(self, batch_id: str) -> List[Dict[str, Any]]:
+    async def get_batch_results(
+        self,
+        batch_id: str,
+        user_id: Optional[str] = None,
+        is_admin: bool = False,
+    ) -> List[Dict[str, Any]]:
         """获取批量任务的所有审核结果."""
         async with self.async_session() as session:
             stmt = select(ReviewHistory).where(
                 ReviewHistory.batch_id == batch_id,
                 ReviewHistory.is_deleted == False,
-            ).order_by(ReviewHistory.reviewed_at)
+            )
+            stmt = self._apply_user_scope(stmt, user_id, is_admin)
+            stmt = stmt.order_by(ReviewHistory.reviewed_at)
 
             result = await session.execute(stmt)
             histories = result.scalars().all()
@@ -372,24 +444,18 @@ class HistoryService:
         self,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
+        user_id: Optional[str] = None,
+        is_admin: bool = False,
     ) -> Dict[str, Any]:
         """获取审核统计数据."""
         async with self.async_session() as session:
             stmt = select(ReviewHistory).where(ReviewHistory.is_deleted == False)
-
-            if start_date:
-                try:
-                    start_dt = datetime.fromisoformat(start_date)
-                    stmt = stmt.where(ReviewHistory.reviewed_at >= start_dt)
-                except ValueError:
-                    pass
-
-            if end_date:
-                try:
-                    end_dt = datetime.fromisoformat(end_date)
-                    stmt = stmt.where(ReviewHistory.reviewed_at <= end_dt)
-                except ValueError:
-                    pass
+            stmt = self._apply_user_scope(stmt, user_id, is_admin)
+            stmt = self._apply_list_filters(
+                stmt,
+                start_date=start_date,
+                end_date=end_date,
+            )
 
             result = await session.execute(stmt)
             histories = result.scalars().all()

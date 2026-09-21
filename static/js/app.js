@@ -3151,6 +3151,7 @@ const Pages = {
                     <div class="tabs" style="display:flex;gap:8px;margin-left:auto;">
                         <button class="btn btn-sm btn-primary batch-tab active" data-tab="upload">文件上传</button>
                         <button class="btn btn-sm btn-secondary batch-tab" data-tab="link">链接导入</button>
+                        <button class="btn btn-sm btn-secondary batch-tab" data-tab="master">总文档导入</button>
                     </div>
                 </div>
                 <div class="card-body">
@@ -3292,6 +3293,76 @@ const Pages = {
                         </div>
                     </div>
 
+                    <!-- 总文档导入模式 -->
+                    <div id="batch-master-panel" style="display:none;">
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label class="form-label">任务名称（可选）</label>
+                                <input type="text" id="batch-master-task-name" placeholder="批量审核任务">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">规则模板</label>
+                                <select id="batch-master-rule-template">
+                                    <option value="general">通用模板</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">提报表文件 <span class="required">*</span></label>
+                            <div style="display:flex;gap:8px;align-items:center;">
+                                <input type="file" id="batch-master-submission-file" accept=".xlsx,.xls,.json,.txt" style="display:none;">
+                                <button class="btn btn-secondary btn-sm" id="batch-choose-master-submission-btn">选择提报表</button>
+                                <span id="batch-master-submission-file-name" class="text-secondary text-sm">未选择</span>
+                                <button class="btn btn-text btn-sm" id="batch-clear-master-submission-btn" style="display:none;color:#dc2626;">清除</button>
+                            </div>
+                            <div class="form-hint">支持 xlsx/xls/json/txt 格式，所有子文档共用此提报表</div>
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">总文档链接（与下方 Excel 文件二选一）</label>
+                            <input type="text" id="batch-master-url" placeholder="粘贴包含子文档链接的飞书表格/飞书文档链接，如 https://xxx.feishu.cn/sheets/...">
+                            <div class="form-hint">系统将自动解析总文档，提取其中的子文档超链接（最多 30 个），再逐个抓取正文进行批量审核</div>
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">或上传包含链接的 Excel 文件</label>
+                            <div style="display:flex;gap:8px;align-items:center;">
+                                <input type="file" id="batch-master-file" accept=".xlsx,.xls" style="display:none;">
+                                <button class="btn btn-secondary btn-sm" id="batch-choose-master-file-btn">选择 Excel 文件</button>
+                                <span id="batch-master-file-name" class="text-secondary text-sm">未选择</span>
+                                <button class="btn btn-text btn-sm" id="batch-clear-master-file-btn" style="display:none;color:#dc2626;">清除</button>
+                            </div>
+                            <div class="form-hint">支持单元格超链接和纯文本 URL 两种形式（最多提取 30 个链接）</div>
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">官网 URL（可选，所有文档共用）</label>
+                            <input type="text" id="batch-master-official-urls" placeholder="多个 URL 用英文逗号分隔，如 https://a.com,https://b.com">
+                        </div>
+
+                        <div class="form-row" style="margin-top:16px;">
+                            <div class="form-group" style="margin-bottom:0;">
+                                <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                                    <input type="checkbox" id="batch-master-crawl-option">
+                                    <span>爬取官网补充信息</span>
+                                </label>
+                            </div>
+                            <div class="form-group" style="margin-bottom:0;">
+                                <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                                    <input type="checkbox" id="batch-master-llm-option" checked>
+                                    <span>启用 LLM 语义审核</span>
+                                </label>
+                            </div>
+                        </div>
+
+                        <div style="margin-top:20px;padding-top:16px;border-top:1px solid #e2e8f0;display:flex;justify-content:flex-end;gap:8px;">
+                            <button class="btn btn-primary" id="batch-master-submit">
+                                <span>解析总文档并批量审核</span>
+                            </button>
+                        </div>
+                    </div>
+
                 </div>
             </div>
 
@@ -3362,13 +3433,14 @@ const Pages = {
                 e.currentTarget.classList.add('btn-primary');
                 document.getElementById('batch-upload-panel').style.display = tabName === 'upload' ? 'block' : 'none';
                 document.getElementById('batch-link-panel').style.display = tabName === 'link' ? 'block' : 'none';
+                document.getElementById('batch-master-panel').style.display = tabName === 'master' ? 'block' : 'none';
             });
         });
 
         // 加载规则模板列表
         ApiClient.get('/rules/templates').then(res => {
             const templates = res.templates || [];
-            ['batch-rule-template', 'batch-link-rule-template'].forEach(id => {
+            ['batch-rule-template', 'batch-link-rule-template', 'batch-master-rule-template'].forEach(id => {
                 const sel = document.getElementById(id);
                 if (sel && templates.length > 0) {
                     sel.innerHTML = templates.map(t => `<option value="${UI.escapeHtml(t)}">${UI.escapeHtml(t)}</option>`).join('');
@@ -3582,6 +3654,112 @@ const Pages = {
                 } finally {
                     this.disabled = false;
                     this.innerHTML = '<span>开始批量审核</span>';
+                    UI.loading(false);
+                }
+            });
+        }
+
+        // 总文档导入模式 — 提报表文件选择
+        const masterChooseSubBtn = document.getElementById('batch-choose-master-submission-btn');
+        const masterSubFileInput = document.getElementById('batch-master-submission-file');
+        if (masterChooseSubBtn && masterSubFileInput) {
+            masterChooseSubBtn.addEventListener('click', () => masterSubFileInput.click());
+            masterSubFileInput.addEventListener('change', function() {
+                if (this.files && this.files.length > 0) {
+                    App._batchMasterSubmissionFile = this.files[0];
+                    document.getElementById('batch-master-submission-file-name').textContent = this.files[0].name;
+                    document.getElementById('batch-clear-master-submission-btn').style.display = 'inline-block';
+                }
+            });
+        }
+        const masterClearSubBtn = document.getElementById('batch-clear-master-submission-btn');
+        if (masterClearSubBtn) {
+            masterClearSubBtn.addEventListener('click', () => {
+                App._batchMasterSubmissionFile = null;
+                document.getElementById('batch-master-submission-file').value = '';
+                document.getElementById('batch-master-submission-file-name').textContent = '未选择';
+                masterClearSubBtn.style.display = 'none';
+            });
+        }
+
+        // 总文档导入模式 — Excel 文件选择
+        const masterChooseFileBtn = document.getElementById('batch-choose-master-file-btn');
+        const masterFileInput = document.getElementById('batch-master-file');
+        if (masterChooseFileBtn && masterFileInput) {
+            masterChooseFileBtn.addEventListener('click', () => masterFileInput.click());
+            masterFileInput.addEventListener('change', function() {
+                if (this.files && this.files.length > 0) {
+                    App._batchMasterFile = this.files[0];
+                    document.getElementById('batch-master-file-name').textContent = this.files[0].name;
+                    document.getElementById('batch-clear-master-file-btn').style.display = 'inline-block';
+                }
+            });
+        }
+        const masterClearFileBtn = document.getElementById('batch-clear-master-file-btn');
+        if (masterClearFileBtn) {
+            masterClearFileBtn.addEventListener('click', () => {
+                App._batchMasterFile = null;
+                document.getElementById('batch-master-file').value = '';
+                document.getElementById('batch-master-file-name').textContent = '未选择';
+                masterClearFileBtn.style.display = 'none';
+            });
+        }
+
+        // 总文档导入模式 — 提交批量审核
+        const masterSubmitBtn = document.getElementById('batch-master-submit');
+        if (masterSubmitBtn) {
+            masterSubmitBtn.addEventListener('click', async function() {
+                const masterUrl = document.getElementById('batch-master-url').value.trim();
+                const hasUrl = !!masterUrl;
+                const hasFile = !!App._batchMasterFile;
+
+                if (hasUrl === hasFile) {
+                    UI.toast('请提供总文档链接或 Excel 文件（二选一）', 'warning');
+                    return;
+                }
+                if (!App._batchMasterSubmissionFile) {
+                    UI.toast('请选择提报表文件', 'warning');
+                    return;
+                }
+
+                this.disabled = true;
+                this.innerHTML = '<div class="spinner"></div> 解析总文档中...';
+                UI.loading(true, '正在解析总文档、提取子链接并提交批量审核...');
+
+                try {
+                    const formData = new FormData();
+                    if (hasUrl) {
+                        formData.append('master_url', masterUrl);
+                    } else {
+                        formData.append('master_file', App._batchMasterFile);
+                    }
+                    formData.append('submission_file', App._batchMasterSubmissionFile);
+
+                    const taskName = document.getElementById('batch-master-task-name').value.trim();
+                    if (taskName) formData.append('task_name', taskName);
+
+                    const ruleTpl = document.getElementById('batch-master-rule-template').value;
+                    formData.append('rule_template', ruleTpl);
+
+                    const officialUrls = document.getElementById('batch-master-official-urls').value.trim();
+                    if (officialUrls) formData.append('official_urls', officialUrls);
+
+                    formData.append('crawl_official_urls', document.getElementById('batch-master-crawl-option').checked);
+                    formData.append('use_llm', document.getElementById('batch-master-llm-option').checked);
+
+                    const progress = await ApiClient.post('/review/batch/from-master-doc', formData, true);
+                    if (progress.warnings && progress.warnings.length > 0) {
+                        UI.toast(progress.warnings[0], 'warning');
+                    }
+                    UI.toast(`批量任务已提交，ID: ${progress.batch_id}`, 'success');
+                    App._lastBatchId = progress.batch_id;
+                    document.getElementById('batch-id-input').value = progress.batch_id;
+                    self.renderBatchProgress(progress);
+                } catch (err) {
+                    UI.toast(err.message || '提交失败', 'error');
+                } finally {
+                    this.disabled = false;
+                    this.innerHTML = '<span>解析总文档并批量审核</span>';
                     UI.loading(false);
                 }
             });

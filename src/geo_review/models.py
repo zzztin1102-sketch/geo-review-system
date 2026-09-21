@@ -1,12 +1,10 @@
 """GEO 生文审核核心数据模型."""
-
-from typing import List, Optional
+from typing import List, Optional, ClassVar
 from pydantic import BaseModel, Field, field_validator
 
 
 class Submission(BaseModel):
     """GEO 生文提报表 — 与 Excel A–N 列及 submission.schema.json 对齐."""
-
     task_name: str = Field(
         default="未指定任务", min_length=1, max_length=200,
         description="任务名称，建议含产品名与日期"
@@ -134,3 +132,8 @@ class CrawledDomain(BaseModel):
     total_chars: int = Field(default=0, description="总字符数")
     crawled_at: str = Field(default="", description="首次爬取时间")
     from_cache: bool = Field(default=False, description="是否全部来自缓存")
+
+
+class BatchReviewRequest(BaseModel):
+    """批量审核请求模型"""
+    MAX_BATCH_ITEMS: ClassVar[int] = 30

@@ -321,9 +321,10 @@ class BatchReviewService:
                     last_error = e
                     error_msg = str(e).lower()
 
+                    # 仅对明确的瞬态错误重试（过宽的 connection/network 会误重试不可恢复错误）
                     is_retryable = any(k in error_msg for k in [
-                        "rate limit", "timeout", "temporary", "503", "502",
-                        "connection", "network",
+                        "rate limit", "429", "timeout", "timed out",
+                        "temporary", "temporarily", "503", "502", "504",
                     ])
 
                     if attempt < self._item_max_retries and is_retryable:

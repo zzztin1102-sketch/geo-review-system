@@ -32,6 +32,7 @@ import json
 import logging
 import re
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -170,8 +171,9 @@ class FactChecker:
         self.enable_deep_fetch = enable_deep_fetch
         self.max_deep_fetch = max_deep_fetch
         self.deep_fetch_timeout = deep_fetch_timeout
-        # URL → 正文缓存（避免重复抓取）
-        self._page_content_cache: Dict[str, str] = {}
+        # URL → 正文缓存（LRU 限容，避免长期运行内存无限增长）
+        self._page_content_cache: "OrderedDict[str, str]" = OrderedDict()
+        self._page_cache_max = 200  # 最多缓存 200 个网页正文
 
     def check(
         self,
@@ -485,6 +487,13 @@ class FactChecker:
             logger.debug(f"FactChecker[Agentic]: 搜索失败 [{query}]: {e}")
             return []
 
+    def _cache_page_content(self, url: str, text: str) -> None:
+        """写入页面正文缓存（LRU 限容）."""
+        self._page_content_cache[url] = text
+        self._page_content_cache.move_to_end(url)
+        while len(self._page_content_cache) > self._page_cache_max:
+            self._page_content_cache.popitem(last=False)
+
     def _fetch_page_content(self, url: str) -> str:
         """深度抓取网页完整正文（增强证据质量）.
 
@@ -505,8 +514,9 @@ class FactChecker:
         if not url or not url.startswith(("http://", "https://")):
             return ""
 
-        # 缓存命中
+        # 缓存命中（命中后移到末尾，维持 LRU 热度）
         if url in self._page_content_cache:
+            self._page_content_cache.move_to_end(url)
             return self._page_content_cache[url]
 
         # SSRF 防护
@@ -515,7 +525,7 @@ class FactChecker:
             validate_url(url)
         except Exception as e:
             logger.debug(f"FactChecker: 深度抓取 SSRF 校验失败 [{url}]: {e}")
-            self._page_content_cache[url] = ""
+            self._cache_page_content(url, "")
             return ""
 
         try:
@@ -570,7 +580,7 @@ class FactChecker:
                     text = body.get_text(separator="\n", strip=True)
 
             if not text or len(text) < 30:
-                self._page_content_cache[url] = ""
+                self._cache_page_content(url, "")
                 return ""
 
             # 清洗：合并多余空白、限制长度
@@ -580,13 +590,13 @@ class FactChecker:
             if len(text) > 3000:
                 text = text[:3000]
 
-            self._page_content_cache[url] = text
+            self._cache_page_content(url, text)
             logger.debug(f"FactChecker: 深度抓取成功 [{url}] {len(text)} 字符")
             return text
 
         except Exception as e:
             logger.debug(f"FactChecker: 深度抓取失败 [{url}]: {e}")
-            self._page_content_cache[url] = ""
+            self._cache_page_content(url, "")
             return ""
 
     def _deep_fetch_for_results(
@@ -790,11 +800,18 @@ class FactChecker:
         return "\n".join(parts)
 
     @staticmethod
-    def _verify_citation(evidence_text: str, accumulated_evidence: List[str]) -> bool:
+    def _ngrams(s: str, n: int = 3) -> set:
+        """提取字符级 n-gram 集合."""
+        if len(s) < n:
+            return {s} if s else set()
+        return {s[i:i + n] for i in range(len(s) - n + 1)}
+
+    @classmethod
+    def _verify_citation(cls, evidence_text: str, accumulated_evidence: List[str]) -> bool:
         """引用回验 — 检查 LLM 输出的 evidence_text 是否在搜索结果中可定位.
 
-        防止 LLM 编造证据（幻觉）。采用模糊匹配：取 evidence_text 的连续片段，
-        检查是否在累积的搜索结果文本中出现。
+        防止 LLM 编造证据（幻觉）。采用 n-gram 重叠率而非精确子串匹配，
+        容忍 LLM 对真实证据的轻度改写（合并句子、调整语序），减少误判。
 
         Args:
             evidence_text: LLM 声称引用的证据文本
@@ -819,22 +836,20 @@ class FactChecker:
         if not norm_evidence or not norm_all:
             return True
 
-        # 取 evidence_text 的前 20、中 20、后 20 字符做三段匹配
-        # 只要任一段在搜索结果中可定位，就算通过
-        check_segments = []
-        if len(norm_evidence) > 60:
-            check_segments.append(norm_evidence[:20])
-            check_segments.append(norm_evidence[len(norm_evidence)//2:len(norm_evidence)//2+20])
-            check_segments.append(norm_evidence[-20:])
-        else:
-            check_segments.append(norm_evidence[:20] if len(norm_evidence) >= 20 else norm_evidence)
+        # 整段精确包含 → 直接通过
+        if norm_evidence in norm_all:
+            return True
 
-        for seg in check_segments:
-            if len(seg) >= 5 and seg in norm_all:
-                return True
+        # n-gram 重叠率：evidence 中有多少比例的 n-gram 能在搜索结果中找到
+        # 阈值 0.5：只要超过一半的特征片段可定位，即认为引用真实（容忍轻度改写）
+        ev_grams = cls._ngrams(norm_evidence, n=3)
+        all_grams = cls._ngrams(norm_all, n=3)
+        if not ev_grams:
+            return True
 
-        # 三段都没匹配到 → 疑似编造
-        return False
+        overlap = len(ev_grams & all_grams)
+        overlap_ratio = overlap / len(ev_grams)
+        return overlap_ratio >= 0.5
 
     def _force_verdict(
         self,

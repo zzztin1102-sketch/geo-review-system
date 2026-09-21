@@ -1,6 +1,8 @@
 """规则执行器 — 执行硬性规则、模式规则、复合规则，输出问题列表."""
 
+import logging
 import re
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -12,6 +14,8 @@ from geo_review.rules.issues import (
     IssueType,
 )
 from geo_review.rules.models import RuleSet, RuleExecutionLog
+
+logger = logging.getLogger(__name__)
 
 
 class RuleEngine:
@@ -377,28 +381,23 @@ class RuleEngine:
         ]
 
         for pattern, contact_type, severity in patterns:
-            try:
-                regex = re.compile(pattern)
-                matches = list(regex.finditer(content))
-                for match in matches:
-                    matched_text = match.group(0)
-                    snippet = self._extract_sentence_context(content, match.start(), match.end())
-                    counter[0] += 1
-                    issues.append(Issue(
-                        id=Issue.make_id(counter[0]),
-                        type=IssueType.SEMANTIC_RISK,
-                        severity=severity,
-                        title=f"明文{contact_type}泄露",
-                        evidence=IssueEvidence(
-                            snippet=snippet,
-                            reference_source="review_rule",
-                            reference_detail=f"检测到明文{contact_type}：{matched_text}",
-                        ),
-                        reason=f"正文中出现了明文{contact_type}「{matched_text}」，可能导致客户联系信息被恶意采集或滥用，违反个人信息保护相关规定。",
-                        suggestion=f"删除正文中的明文{contact_type}，如需提供联系方式，建议通过官网或联系表单等正规渠道。",
-                    ))
-            except re.error:
-                continue
+            for match in self._safe_finditer(pattern, content):
+                matched_text = match.group(0)
+                snippet = self._extract_sentence_context(content, match.start(), match.end())
+                counter[0] += 1
+                issues.append(Issue(
+                    id=Issue.make_id(counter[0]),
+                    type=IssueType.SEMANTIC_RISK,
+                    severity=severity,
+                    title=f"明文{contact_type}泄露",
+                    evidence=IssueEvidence(
+                        snippet=snippet,
+                        reference_source="review_rule",
+                        reference_detail=f"检测到明文{contact_type}：{matched_text}",
+                    ),
+                    reason=f"正文中出现了明文{contact_type}「{matched_text}」，可能导致客户联系信息被恶意采集或滥用，违反个人信息保护相关规定。",
+                    suggestion=f"删除正文中的明文{contact_type}，如需提供联系方式，建议通过官网或联系表单等正规渠道。",
+                ))
 
         return issues
 
@@ -449,8 +448,7 @@ class RuleEngine:
         issues = []
 
         # 模式1: "通过...，使得..." 缺主语
-        pattern1 = re.compile(r"通过[^，。；\n]{3,60}，使得[^，。；\n]{3,60}")
-        for match in pattern1.finditer(content):
+        for match in self._safe_finditer(r"通过[^，。；\n]{3,60}，使得[^，。；\n]{3,60}", content):
             counter[0] += 1
             snippet = self._extract_sentence_context(content, match.start(), match.end())
             issues.append(Issue(
@@ -469,8 +467,7 @@ class RuleEngine:
             ))
 
         # 模式2: "不仅..." 后面没有 "而且/还/也" 等呼应
-        pattern2 = re.compile(r"不仅[^，。；\n]{3,60}(?![^，。；\n]{0,60}(?:而且|还|也|更|甚至))")
-        for match in pattern2.finditer(content):
+        for match in self._safe_finditer(r"不仅[^，。；\n]{3,60}(?![^，。；\n]{0,60}(?:而且|还|也|更|甚至))", content):
             start = max(0, match.start() - 120)
             window = content[start:match.end() + 120]
             if "而且" not in window and "还" not in window and "也" not in window and "更" not in window:
@@ -587,29 +584,24 @@ class RuleEngine:
         ]
 
         for pattern, content_type, severity in unverified_source_patterns:
-            try:
-                regex = re.compile(pattern)
-                matches = list(regex.finditer(content))
-                for match in matches:
-                    matched_text = match.group(0)
-                    snippet = self._extract_sentence_context(content, match.start(), match.end())
-                    counter[0] += 1
-                    issues.append(Issue(
-                        id=Issue.make_id(counter[0]),
-                        type=IssueType.UNSUPPORTED_CLAIM,
-                        severity=severity,
-                        title=f"疑似未标注来源的{content_type}",
-                        evidence=IssueEvidence(
-                            snippet=snippet,
-                            reference_source="review_rule",
-                            reference_detail=f"检测到{content_type}表述：{matched_text}，需核实来源",
-                        ),
-                        reason=f"正文中出现了{content_type}表述「{matched_text}」，但该{content_type}未在提报表或官网中找到对应依据，需人工核实来源是否真实有效。",
-                        suggestion=f"请核实{content_type}「{matched_text}」的真实性和来源，如需保留请在提报表中补充相关证明材料或引用来源。",
-                        confidence=0.6,
-                    ))
-            except re.error:
-                continue
+            for match in self._safe_finditer(pattern, content):
+                matched_text = match.group(0)
+                snippet = self._extract_sentence_context(content, match.start(), match.end())
+                counter[0] += 1
+                issues.append(Issue(
+                    id=Issue.make_id(counter[0]),
+                    type=IssueType.UNSUPPORTED_CLAIM,
+                    severity=severity,
+                    title=f"疑似未标注来源的{content_type}",
+                    evidence=IssueEvidence(
+                        snippet=snippet,
+                        reference_source="review_rule",
+                        reference_detail=f"检测到{content_type}表述：{matched_text}，需核实来源",
+                    ),
+                    reason=f"正文中出现了{content_type}表述「{matched_text}」，但该{content_type}未在提报表或官网中找到对应依据，需人工核实来源是否真实有效。",
+                    suggestion=f"请核实{content_type}「{matched_text}」的真实性和来源，如需保留请在提报表中补充相关证明材料或引用来源。",
+                    confidence=0.6,
+                ))
 
         return issues
 
@@ -620,12 +612,8 @@ class RuleEngine:
         issues = []
 
         for rule in self.rule_set.get_exaggeration_patterns():
-            try:
-                pattern = re.compile(rule.pattern)
-            except re.error:
-                continue
-
-            for match in pattern.finditer(content):
+            # ReDoS 防护：走安全匹配（高危模式拦截 + 超时 + 限量）
+            for match in self._safe_finditer(rule.pattern, content):
                 matched_text = match.group(0)
                 snippet = self._extract_sentence_context(content, match.start(), match.end())
 
@@ -677,11 +665,7 @@ class RuleEngine:
                 idx += len(kw)
 
         for pattern_str in rule.patterns:
-            try:
-                pattern = re.compile(pattern_str)
-            except re.error:
-                continue
-            for match in pattern.finditer(content):
+            for match in self._safe_finditer(pattern_str, content):
                 disparagement_triggers.append((match.group(0), match.start(), match.end()))
 
         if not disparagement_triggers:
@@ -735,11 +719,6 @@ class RuleEngine:
 
         issues = []
 
-        try:
-            num_pattern = re.compile(rule.number_pattern)
-        except re.error:
-            return issues
-
         # 收集允许的事实集合
         allowed_facts: List[str] = []
         if rule.require_allowed_match and self.submission:
@@ -752,7 +731,7 @@ class RuleEngine:
                 if page.text:
                     website_text += "\n" + page.text
 
-        for match in num_pattern.finditer(content):
+        for match in self._safe_finditer(rule.number_pattern, content):
             number = match.group(0)
             snippet = self._extract_sentence_context(content, match.start(), match.end())
 
@@ -800,15 +779,71 @@ class RuleEngine:
     # ------------------------------------------------------------------
     # 辅助方法
     # ------------------------------------------------------------------
-    @staticmethod
-    def _find_matches(content: str, pattern: str, is_regex: bool) -> List[str]:
+    # ReDoS 防护配置
+    _REGEX_TIMEOUT_SECONDS = 1.0   # 单个正则匹配超时
+    _REGEX_MAX_MATCHES = 500       # 单条规则最多返回匹配数（防爆内存）
+
+    @classmethod
+    def _is_dangerous_regex(cls, pattern: str) -> bool:
+        """检测灾难性回溯的高危正则模式（嵌套量词 / 重叠交替）.
+
+        示例高危模式: (a+)+$、(a|a)*、(x+x+)+y
+        """
+        # 嵌套量词: 量词包裹的子表达式内部又含量词，如 (a+)+、(.*)+、(x+)*+
+        if re.search(r'\([^)]*[+*][^)]*\)[+*{]', pattern):
+            return True
+        # 重叠交替 + 量词: (a|a)* 这类分支前缀高度重叠且外层带量词
+        if re.search(r'\([^)]*\|[^)]*\)[+*]', pattern):
+            return True
+        return False
+
+    @classmethod
+    def _safe_finditer(cls, pattern: str, content: str):
+        """ReDoS 防护的正则匹配：线程超时 + 高危模式拦截.
+
+        Returns:
+            匹配迭代器结果列表；超时 / 语法错误 / 高危模式时返回空列表
+        """
+        if cls._is_dangerous_regex(pattern):
+            logger.warning(f"规则引擎: 拦截高危正则（ReDoS 风险）: {pattern[:60]}")
+            return []
+
+        try:
+            regex = re.compile(pattern)
+        except re.error:
+            return []
+
+        # 用子线程 + join 实现超时（标准库 re 无原生超时参数）
+        result_box: List = []
+        error_box: List = []
+
+        def _run():
+            try:
+                matches = []
+                for i, m in enumerate(regex.finditer(content)):
+                    if i >= cls._REGEX_MAX_MATCHES:
+                        break
+                    matches.append(m)
+                result_box.append(matches)
+            except Exception as e:  # noqa: BLE001
+                error_box.append(e)
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        t.join(timeout=cls._REGEX_TIMEOUT_SECONDS)
+        if t.is_alive():
+            # 超时：线程仍在跑（daemon 线程随主线程退出被回收）
+            logger.warning(f"规则引擎: 正则匹配超时（{cls._REGEX_TIMEOUT_SECONDS}s），已跳过: {pattern[:60]}")
+            return []
+        if error_box:
+            return []
+        return result_box[0] if result_box else []
+
+    @classmethod
+    def _find_matches(cls, content: str, pattern: str, is_regex: bool) -> List[str]:
         """查找匹配项."""
         if is_regex:
-            try:
-                regex = re.compile(pattern)
-                return [m.group(0) for m in regex.finditer(content)]
-            except re.error:
-                return []
+            return [m.group(0) for m in cls._safe_finditer(pattern, content)]
         else:
             # 简单关键词匹配
             matches = []
@@ -821,19 +856,15 @@ class RuleEngine:
                 idx += len(pattern)
             return matches
 
-    @staticmethod
-    def _find_matches_with_positions(content: str, pattern: str, is_regex: bool) -> List[tuple]:
+    @classmethod
+    def _find_matches_with_positions(cls, content: str, pattern: str, is_regex: bool) -> List[tuple]:
         """查找匹配项并返回位置信息.
 
         Returns:
             List[(match_text, start, end)]
         """
         if is_regex:
-            try:
-                regex = re.compile(pattern)
-                return [(m.group(0), m.start(), m.end()) for m in regex.finditer(content)]
-            except re.error:
-                return []
+            return [(m.group(0), m.start(), m.end()) for m in cls._safe_finditer(pattern, content)]
         else:
             matches = []
             idx = 0
@@ -924,11 +955,7 @@ class RuleEngine:
                 elif cond_type == "contains":
                     conditions_met.append(pattern in content)
                 elif cond_type == "regex":
-                    try:
-                        pat = re.compile(pattern)
-                        conditions_met.append(bool(pat.search(content)))
-                    except re.error:
-                        conditions_met.append(False)
+                    conditions_met.append(bool(self._safe_finditer(pattern, content)))
                 else:
                     conditions_met.append(False)
 
@@ -1042,30 +1069,26 @@ class RuleEngine:
         issues = []
         for risk in self.industry_kb.get_enabled_risks():
             for indicator in risk.indicators:
-                try:
-                    pattern = re.compile(indicator)
-                    matches = list(pattern.finditer(content))
-                    if matches:
-                        counter[0] += 1
-                        first_match = matches[0]
-                        snippet = self._extract_sentence_context(content, first_match.start(), first_match.end())
+                matches = self._safe_finditer(indicator, content)
+                if matches:
+                    counter[0] += 1
+                    first_match = matches[0]
+                    snippet = self._extract_sentence_context(content, first_match.start(), first_match.end())
 
-                        issues.append(Issue(
-                            id=Issue.make_id(counter[0]),
-                            type=IssueType.SEMANTIC_RISK,
-                            severity=IssueSeverity(risk.severity),
-                            title=f"【{self.industry_kb.name}】{risk.name}",
-                            evidence=IssueEvidence(
-                                snippet=snippet,
-                                reference_source="industry_kb",
-                                reference_detail=f"{risk.description}\n风险类型：{risk.risk_type}",
-                            ),
-                            reason=f"该表述触发了{self.industry_kb.name}的风险模式「{risk.name}」。{risk.description}，属于{risk.risk_type}风险，可能在特定场景下引发用户误解或监管关注。",
-                            suggestion=risk.mitigation or f"请检查相关表述，规避{risk.risk_type}风险。建议采用更客观、中性的表达方式，避免使用可能引发{risk.risk_type}的措辞。",
-                        ))
-                        break  # 每个风险模式只触发一次
-                except re.error:
-                    continue
+                    issues.append(Issue(
+                        id=Issue.make_id(counter[0]),
+                        type=IssueType.SEMANTIC_RISK,
+                        severity=IssueSeverity(risk.severity),
+                        title=f"【{self.industry_kb.name}】{risk.name}",
+                        evidence=IssueEvidence(
+                            snippet=snippet,
+                            reference_source="industry_kb",
+                            reference_detail=f"{risk.description}\n风险类型：{risk.risk_type}",
+                        ),
+                        reason=f"该表述触发了{self.industry_kb.name}的风险模式「{risk.name}」。{risk.description}，属于{risk.risk_type}风险，可能在特定场景下引发用户误解或监管关注。",
+                        suggestion=risk.mitigation or f"请检查相关表述，规避{risk.risk_type}风险。建议采用更客观、中性的表达方式，避免使用可能引发{risk.risk_type}的措辞。",
+                    ))
+                    break  # 每个风险模式只触发一次
         return issues
 
     # ------------------------------------------------------------------

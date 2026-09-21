@@ -44,6 +44,8 @@ class ReviewHistory(Base):
     reviewed_at = Column(DateTime, nullable=False)
     duration_ms = Column(Integer, default=0)
     submitted_by = Column(String(100), nullable=True)
+    # 提交用户 ID（用户级数据隔离；NULL 为历史遗留记录或未认证创建）
+    user_id = Column(String(36), nullable=True, index=True)
     batch_id = Column(String(36), nullable=True, index=True)
     item_id = Column(String(100), nullable=True)
     is_deleted = Column(Boolean, default=False)

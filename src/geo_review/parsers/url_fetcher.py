@@ -136,6 +136,41 @@ class URLDocumentFetcher:
     """URL 文档抓取器 — 从 URL 中提取文档文本内容."""
 
     @classmethod
+    def fetch_html(cls, url: str, *, timeout: int = 30) -> tuple:
+        """抓取 URL 原始 HTML（用于总文档超链接提取等场景）.
+
+        Args:
+            url: 文档链接（飞书链接或通用网页 URL）
+            timeout: 超时秒数
+
+        Returns:
+            (html, title) 元组
+
+        Raises:
+            ValueError: 抓取失败
+        """
+        if not url or not url.startswith(("http://", "https://")):
+            raise ValueError("URL 格式无效，需以 http:// 或 https:// 开头")
+
+        # SSRF 防护
+        try:
+            validate_url(url)
+        except SSRFError as exc:
+            raise ValueError(f"URL 安全校验失败: {exc}")
+
+        # 1. 优先 Playwright（飞书页面为 JS 渲染）
+        try:
+            return cls._fetch_with_playwright(url, timeout)
+        except Exception as exc:
+            logger.warning(f"Playwright 抓取失败，降级为静态: {exc}")
+
+        # 2. 降级 requests 静态抓取
+        try:
+            return cls._fetch_with_requests(url, timeout)
+        except Exception as exc:
+            raise ValueError(f"无法获取页面内容: {exc}")
+
+    @classmethod
     def fetch(
         cls,
         url: str,

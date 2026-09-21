@@ -11,7 +11,10 @@ import hashlib
 import json
 import logging
 import random
+import re
+import threading
 import time
+from collections import OrderedDict
 from typing import Any, Dict, Optional
 
 from geo_review.llm.models import LLMProviderConfig
@@ -19,46 +22,66 @@ from geo_review.llm.models import LLMProviderConfig
 logger = logging.getLogger(__name__)
 
 
-# ✅ 新增：简单的 TTL 缓存
 class _LLMCache:
-    """轻量级 LLM 响应缓存（基于 messages 哈希）."""
+    """LLM 响应缓存（LRU + TTL + 线程安全）.
+
+    修复点：
+        - 并发安全：所有读写操作加锁，避免线程池场景下
+          ``dictionary changed size during iteration`` 崩溃
+        - LRU 淘汰：超限批量淘汰最早 10%，替代原先 O(n²) 且只删单条的实现
+        - 缓存键归一化：将 messages 中的随机 fence token 归一化为占位符，
+          避免防注入 fence 导致缓存永远 miss
+    """
+
+    _MAX_ENTRIES = 500
+    _EVICT_RATIO = 0.1  # 超限时淘汰最早的 10%
+    # 匹配防注入 fence token（prompts.py 生成的 <USER_CONTENT fence_id=xxx>）
+    _FENCE_RE = re.compile(r'fence_id=[a-f0-9]{12}')
 
     def __init__(self, ttl: int = 3600):
-        self._store: Dict[str, tuple] = {}  # key -> (result, timestamp)
+        # OrderedDict 维护插入顺序，便于 LRU 淘汰
+        self._store: "OrderedDict[str, tuple]" = OrderedDict()
         self._ttl = ttl
+        self._lock = threading.Lock()
 
     def get(self, messages: list) -> Optional[Dict[str, Any]]:
         key = self._make_key(messages)
-        if key in self._store:
-            result, ts = self._store[key]
-            if time.time() - ts < self._ttl:
-                logger.info("LLM 缓存命中")
-                cached = result.copy()
-                cached["cache_hit"] = True
-                return cached
-            else:
-                del self._store[key]
-        return None
+        with self._lock:
+            if key in self._store:
+                result, ts = self._store[key]
+                if time.time() - ts < self._ttl:
+                    logger.info("LLM 缓存命中")
+                    # 移到末尾（标记为最近使用）
+                    self._store.move_to_end(key)
+                    cached = result.copy()
+                    cached["cache_hit"] = True
+                    return cached
+                else:
+                    del self._store[key]
+            return None
 
     def set(self, messages: list, result: Dict[str, Any]):
         key = self._make_key(messages)
-        self._store[key] = (result, time.time())
-        # 简单的缓存淘汰：超过 500 条时清理最早的
-        if len(self._store) > 500:
-            oldest = min(self._store.values(), key=lambda x: x[1])
-            for k, v in list(self._store.items()):
-                if v[1] == oldest[1]:
-                    del self._store[k]
-                    break
+        with self._lock:
+            self._store[key] = (result, time.time())
+            self._store.move_to_end(key)
+            # 超限 → 批量淘汰最早的 N 条
+            if len(self._store) > self._MAX_ENTRIES:
+                evict_count = max(1, int(self._MAX_ENTRIES * self._EVICT_RATIO))
+                for _ in range(evict_count):
+                    self._store.popitem(last=False)  # 删除最旧条目
 
-    @staticmethod
-    def _make_key(messages: list) -> str:
-        """根据 messages 生成缓存 key."""
+    @classmethod
+    def _make_key(cls, messages: list) -> str:
+        """根据 messages 生成缓存 key（归一化随机 fence，避免缓存失效）."""
         raw = json.dumps(messages, ensure_ascii=False, sort_keys=True)
+        # 将随机 fence token 归一化为固定占位符，保证相同语义内容命中同一缓存
+        raw = cls._FENCE_RE.sub('fence_id=NORMALIZED', raw)
         return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
     def clear(self):
-        self._store.clear()
+        with self._lock:
+            self._store.clear()
 
 
 class LLMClient:
